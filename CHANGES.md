@@ -1,3 +1,14 @@
+## Unreleased
+
+- Add a `VersionedSessionInterface` base class and an in-memory
+  reference implementation (`InMemorySessionInterface` and
+  `InMemorySessionStore`). Sessions are stored server-side with
+  optimistic concurrency: saving commits the changeset relative to
+  the version read, changes to different top-level keys merge, and
+  conflicting changes to the same key (including delete versus
+  write) raise `SessionConflictError` rather than silently
+  discarding one side.
+
 ## Version 0.23.1
 
 Released 2026-08-29
