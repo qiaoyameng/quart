@@ -1,3 +1,13 @@
+## Unreleased
+
+- Add a versioned server-side session interface,
+  ``VersionedSessionInterface``, with an in-memory reference
+  implementation, ``InMemorySessionInterface``. Sessions are read at a
+  store version and saved by submitting a changeset relative to that
+  version, so concurrent requests changing different top-level keys
+  merge whilst conflicting changes to the same key raise
+  ``SessionConflictError`` rather than silently overwriting.
+
 ## Version 0.23.1
 
 Released 2026-08-29
