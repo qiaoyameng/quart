@@ -1,3 +1,14 @@
+## Unreleased
+
+- Support asynchronous ``url_value_preprocessor`` functions for
+  requests and websockets, with exceptions handled by the request's
+  error handling chain.
+- Add an awaitable ``async_url_for`` (and
+  ``Quart.async_inject_url_defaults``) so asynchronous
+  ``url_defaults`` functions are supported when building URLs. The
+  synchronous ``url_for`` raises a clear error if an asynchronous
+  ``url_defaults`` function is registered.
+
 ## Version 0.23.1
 
 Released 2026-08-29

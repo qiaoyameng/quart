@@ -6,12 +6,14 @@ import click
 import pytest
 
 from quart import abort
+from quart import async_url_for
 from quart import Blueprint
 from quart import g
 from quart import Quart
 from quart import render_template_string
 from quart import request
 from quart import ResponseReturnValue
+from quart import url_for
 from quart import websocket
 from quart.views import MethodView
 
@@ -464,3 +466,120 @@ async def test_nested_callback_order() -> None:
         await (await client.get("/a")).get_data()
     ) == b"app_1, app_2, parent_1, parent_2, child_1, child_2"
     assert (await (await client.get("/b")).get_data()) == b"child"
+
+
+async def test_nested_blueprint_async_url_value_preprocessors() -> None:
+    app = Quart(__name__)
+    parent = Blueprint("parent", __name__, url_prefix="/<tenant>")
+    child = Blueprint("child", __name__, url_prefix="/child")
+    seen = []
+
+    @app.url_value_preprocessor
+    async def app_preprocessor(_: str, values: dict) -> None:
+        seen.append("app")
+
+    @parent.url_value_preprocessor
+    async def parent_preprocessor(_: str, values: dict) -> None:
+        seen.append("parent")
+        # Resolve the tenant alias asynchronously
+        values["tenant"] = values["tenant"].upper()
+
+    @child.url_value_preprocessor
+    async def child_preprocessor(_: str, values: dict) -> None:
+        seen.append("child")
+
+    @child.route("/page/")
+    async def page(tenant: str) -> ResponseReturnValue:
+        return tenant
+
+    parent.register_blueprint(child)
+    app.register_blueprint(parent)
+
+    test_client = app.test_client()
+    response = await test_client.get("/acme/child/page/")
+    assert (await response.get_data()) == b"ACME"
+    assert seen == ["app", "parent", "child"]
+
+
+async def test_nested_blueprint_async_url_value_preprocessor_error() -> None:
+    app = Quart(__name__)
+    parent = Blueprint("parent", __name__)
+    child = Blueprint("child", __name__)
+
+    @child.url_value_preprocessor
+    async def child_preprocessor(_: str, __: dict) -> None:
+        raise ValueError("child")
+
+    @child.errorhandler(ValueError)
+    async def child_handler(error: ValueError) -> ResponseReturnValue:
+        return str(error), 409
+
+    @child.route("/page/")
+    async def page() -> ResponseReturnValue:
+        return "OK"
+
+    parent.register_blueprint(child)
+    app.register_blueprint(parent)
+
+    test_client = app.test_client()
+    response = await test_client.get("/page/")
+    assert response.status_code == 409
+    assert (await response.get_data()) == b"child"
+
+
+async def test_nested_blueprint_async_url_defaults_consistency() -> None:
+    app = Quart(__name__)
+    parent = Blueprint("parent", __name__, url_prefix="/<tenant>")
+    child = Blueprint("child", __name__, url_prefix="/child")
+
+    @parent.url_value_preprocessor
+    async def parent_preprocessor(_: str, values: dict) -> None:
+        values["tenant"] = values["tenant"].upper()
+
+    @parent.url_defaults
+    async def parent_defaults(_: str, values: dict) -> None:
+        values.setdefault("tenant", "acme")
+
+    @child.url_defaults
+    async def child_defaults(_: str, values: dict) -> None:
+        values.setdefault("tenant", "child-default")
+
+    @child.route("/page/")
+    async def page(tenant: str) -> ResponseReturnValue:
+        return tenant
+
+    @child.route("/links/")
+    async def links(tenant: str) -> ResponseReturnValue:
+        default = await async_url_for("parent.child.page")
+        relative = await async_url_for(".page", tenant="other")
+        explicit = await async_url_for("parent.child.page", tenant="explicit")
+        return f"{default} {relative} {explicit}"
+
+    parent.register_blueprint(child)
+    app.register_blueprint(parent)
+
+    test_client = app.test_client()
+    response = await test_client.get("/acme/child/links/")
+    assert (await response.get_data()) == (
+        b"/acme/child/page/ /other/child/page/ /explicit/child/page/"
+    )
+
+
+async def test_nested_blueprint_sync_url_for_with_async_url_defaults() -> None:
+    app = Quart(__name__)
+    parent = Blueprint("parent", __name__, url_prefix="/<tenant>")
+
+    @parent.url_defaults
+    async def parent_defaults(_: str, values: dict) -> None:
+        values.setdefault("tenant", "acme")
+
+    @parent.route("/page/")
+    async def page(tenant: str) -> ResponseReturnValue:
+        return tenant
+
+    app.register_blueprint(parent)
+
+    async with app.test_request_context("/acme/page/"):
+        with pytest.raises(RuntimeError, match="async_url_for"):
+            url_for("parent.page")
+        assert await async_url_for("parent.page") == "/acme/page/"

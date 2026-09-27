@@ -7,6 +7,7 @@ import pytest
 from werkzeug.wrappers import Response as WerkzeugResponse
 
 from quart import abort
+from quart import async_url_for
 from quart import jsonify
 from quart import Quart
 from quart import request
@@ -153,6 +154,70 @@ async def test_url_defaults(app: Quart) -> None:
 
     async with app.test_request_context("/"):
         assert url_for("param") == "/param/hello"
+
+
+async def test_async_url_value_preprocessor(app: Quart) -> None:
+    @app.url_value_preprocessor
+    async def preprocessor(_: str, values: dict) -> None:
+        values["value"] = values["value"].upper()
+
+    test_client = app.test_client()
+    response = await test_client.get("/param/hello")
+    assert b"HELLO" == (await response.get_data())
+
+
+async def test_async_url_value_preprocessor_error_handled(app: Quart) -> None:
+    @app.url_value_preprocessor
+    async def preprocessor(_: str, __: dict) -> None:
+        raise ValueError("Something Unique")
+
+    @app.errorhandler(ValueError)
+    async def handler(_: ValueError) -> ResponseReturnValue:
+        return "Something Unique", 409
+
+    test_client = app.test_client()
+    response = await test_client.get("/param/hello")
+    assert response.status_code == 409
+    assert b"Something Unique" in (await response.get_data())
+
+
+async def test_async_url_value_preprocessor_websocket(app: Quart) -> None:
+    @app.url_value_preprocessor
+    async def preprocessor(_: str, values: dict) -> None:
+        values["value"] = values["value"].upper()
+
+    @app.websocket("/ws/<value>")
+    async def preprocessor_ws(value: str) -> None:
+        await websocket.send(value)
+
+    test_client = app.test_client()
+    async with test_client.websocket("/ws/hello") as test_websocket:
+        result = await test_websocket.receive()
+    assert result == "HELLO"
+
+
+async def test_async_url_defaults(app: Quart) -> None:
+    @app.url_defaults
+    async def async_defaults(_: str, values: dict) -> None:
+        values["value"] = values.get("value", "async")
+
+    @app.url_defaults
+    def sync_defaults(_: str, values: dict) -> None:
+        values.setdefault("value", "sync")
+
+    async with app.test_request_context("/"):
+        assert await async_url_for("param") == "/param/async"
+        assert await async_url_for("param", value="explicit") == "/param/explicit"
+
+
+async def test_sync_url_for_with_async_url_defaults_errors(app: Quart) -> None:
+    @app.url_defaults
+    async def async_defaults(_: str, values: dict) -> None:
+        values["value"] = "async"
+
+    async with app.test_request_context("/"):
+        with pytest.raises(RuntimeError, match="async_url_for"):
+            url_for("param")
 
 
 async def test_not_found_error(app: Quart) -> None:

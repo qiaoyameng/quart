@@ -59,6 +59,7 @@ from .globals import g
 from .globals import request
 from .globals import session
 from .helpers import _CollectErrors
+from .helpers import _split_blueprint_path
 from .helpers import get_debug_flag
 from .helpers import get_flashed_messages
 from .helpers import send_from_directory
@@ -683,8 +684,57 @@ class Quart(App):
             _scheme: A specific scheme to use.
             values: The values to build into the URL, as specified in
                 the endpoint rule.
-        """
 
+        Note that this cannot be used if any ``url_defaults`` functions
+        are asynchronous, use :meth:`async_url_for` instead.
+        """
+        url_adapter, endpoint, external = self._url_for_adapter(
+            endpoint, _external, _scheme
+        )
+        self.inject_url_defaults(endpoint, values)
+        return self._build_url(
+            url_adapter, endpoint, values, _anchor, external, _method, _scheme
+        )
+
+    async def async_url_for(
+        self,
+        endpoint: str,
+        *,
+        _anchor: str | None = None,
+        _external: bool | None = None,
+        _method: str | None = None,
+        _scheme: str | None = None,
+        **values: Any,
+    ) -> str:
+        """Return the url for a specific endpoint, awaiting url defaults.
+
+        This is the asynchronous equivalent of :meth:`url_for`, which
+        is required if any ``url_defaults`` functions are asynchronous.
+
+        Arguments:
+            endpoint: The endpoint to build a url for, if prefixed with
+                ``.`` it targets endpoint's in the current blueprint.
+            _anchor: Additional anchor text to append (i.e. #text).
+            _external: Return an absolute url for external (to app) usage.
+            _method: The method to consider alongside the endpoint.
+            _scheme: A specific scheme to use.
+            values: The values to build into the URL, as specified in
+                the endpoint rule.
+        """
+        url_adapter, endpoint, external = self._url_for_adapter(
+            endpoint, _external, _scheme
+        )
+        await self.async_inject_url_defaults(endpoint, values)
+        return self._build_url(
+            url_adapter, endpoint, values, _anchor, external, _method, _scheme
+        )
+
+    def _url_for_adapter(
+        self,
+        endpoint: str,
+        _external: bool | None,
+        _scheme: str | None,
+    ) -> tuple[MapAdapter, str, bool]:
         app_context = _cv_app.get(None)
 
         if has_request_context():
@@ -722,8 +772,18 @@ class Quart(App):
         if _scheme is not None and not _external:
             raise ValueError("External must be True for scheme usage")
 
-        self.inject_url_defaults(endpoint, values)
+        return url_adapter, endpoint, _external
 
+    def _build_url(
+        self,
+        url_adapter: MapAdapter,
+        endpoint: str,
+        values: dict[str, Any],
+        _anchor: str | None,
+        _external: bool,
+        _method: str | None,
+        _scheme: str | None,
+    ) -> str:
         old_scheme = None
         if _scheme is not None:
             old_scheme = url_adapter.url_scheme
@@ -743,6 +803,51 @@ class Quart(App):
             quoted_anchor = quote(_anchor, safe="%!#$&'()*+,/:;=?@")
             url = f"{url}#{quoted_anchor}"
         return url
+
+    def inject_url_defaults(self, endpoint: str, values: dict[str, Any]) -> None:
+        """Injects the URL defaults for the given endpoint directly into
+        the values dictionary passed.
+
+        This raises a clear error if any ``url_defaults`` function is
+        asynchronous, as it cannot be awaited here - use
+        :meth:`async_inject_url_defaults` (via :meth:`async_url_for`)
+        instead.
+        """
+        for name in self._url_default_names(endpoint):
+            if name in self.url_default_functions:
+                for func in self.url_default_functions[name]:
+                    if iscoroutinefunction(func):
+                        raise RuntimeError(
+                            "Cannot use the asynchronous url_defaults function "
+                            f"{func!r} with the synchronous url_for, use "
+                            "async_url_for instead."
+                        )
+                    func(endpoint, values)
+
+    async def async_inject_url_defaults(
+        self, endpoint: str, values: dict[str, Any]
+    ) -> None:
+        """Injects the URL defaults, awaiting asynchronous functions.
+
+        This is the asynchronous equivalent of
+        :meth:`inject_url_defaults`, supporting synchronous and
+        asynchronous ``url_defaults`` functions.
+        """
+        for name in self._url_default_names(endpoint):
+            if name in self.url_default_functions:
+                for func in self.url_default_functions[name]:
+                    await self.ensure_async(func)(endpoint, values)
+
+    def _url_default_names(self, endpoint: str) -> list[str | None]:
+        # The blueprint names are parsed from the endpoint (rather
+        # than using request.blueprints) as url_for may be called
+        # outside of a request context. The order, app first then
+        # parent to child blueprint, matches the order the
+        # url_value_preprocessors run in for a request.
+        names: list[str | None] = [None]
+        if "." in endpoint:
+            names.extend(reversed(_split_blueprint_path(endpoint.rpartition(".")[0])))
+        return names
 
     def make_shell_context(self) -> dict:
         """Create a context for interactive shell usage.
@@ -1542,7 +1647,9 @@ class Quart(App):
 
         for name in names:
             for processor in self.url_value_preprocessors[name]:
-                processor(ctx.request.endpoint, ctx.request.view_args)
+                await self.ensure_async(processor)(
+                    ctx.request.endpoint, ctx.request.view_args
+                )
 
         for name in names:
             for function in self.before_request_funcs[name]:
@@ -1566,7 +1673,9 @@ class Quart(App):
 
         for name in names:
             for processor in self.url_value_preprocessors[name]:
-                processor(ctx.websocket.endpoint, ctx.websocket.view_args)
+                await self.ensure_async(processor)(
+                    ctx.websocket.endpoint, ctx.websocket.view_args
+                )
 
         for name in names:
             for function in self.before_websocket_funcs[name]:
