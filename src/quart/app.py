@@ -10,10 +10,14 @@ from collections.abc import AsyncGenerator
 from collections.abc import Awaitable
 from collections.abc import Callable
 from collections.abc import Coroutine
+from collections.abc import Iterable
 from datetime import timedelta
 from inspect import isasyncgen
+from inspect import isawaitable
+from inspect import iscoroutine
 from inspect import iscoroutinefunction
 from inspect import isgenerator
+from itertools import chain
 from types import TracebackType
 from typing import Any
 from typing import cast
@@ -59,6 +63,7 @@ from .globals import g
 from .globals import request
 from .globals import session
 from .helpers import _CollectErrors
+from .helpers import _split_blueprint_path
 from .helpers import get_debug_flag
 from .helpers import get_flashed_messages
 from .helpers import send_from_directory
@@ -683,8 +688,57 @@ class Quart(App):
             _scheme: A specific scheme to use.
             values: The values to build into the URL, as specified in
                 the endpoint rule.
-        """
 
+        This requires the :attr:`url_default_functions` to be
+        synchronous, use :meth:`async_url_for` if any are asynchronous.
+        """
+        endpoint, url_adapter, _external = self._prepare_url_for(
+            endpoint, _external, _scheme
+        )
+        self.inject_url_defaults(endpoint, values)
+        return self._build_url(
+            url_adapter, endpoint, values, _anchor, _external, _method, _scheme
+        )
+
+    async def async_url_for(
+        self,
+        endpoint: str,
+        *,
+        _anchor: str | None = None,
+        _external: bool | None = None,
+        _method: str | None = None,
+        _scheme: str | None = None,
+        **values: Any,
+    ) -> str:
+        """Return the url for a specific endpoint, awaiting url defaults.
+
+        This is the awaitable equivalent of :meth:`url_for`, required
+        if any of the :attr:`url_default_functions` are asynchronous.
+
+        Arguments:
+            endpoint: The endpoint to build a url for, if prefixed with
+                ``.`` it targets endpoint's in the current blueprint.
+            _anchor: Additional anchor text to append (i.e. #text).
+            _external: Return an absolute url for external (to app) usage.
+            _method: The method to consider alongside the endpoint.
+            _scheme: A specific scheme to use.
+            values: The values to build into the URL, as specified in
+                the endpoint rule.
+        """
+        endpoint, url_adapter, _external = self._prepare_url_for(
+            endpoint, _external, _scheme
+        )
+        await self.async_inject_url_defaults(endpoint, values)
+        return self._build_url(
+            url_adapter, endpoint, values, _anchor, _external, _method, _scheme
+        )
+
+    def _prepare_url_for(
+        self,
+        endpoint: str,
+        _external: bool | None,
+        _scheme: str | None,
+    ) -> tuple[str, MapAdapter, bool]:
         app_context = _cv_app.get(None)
 
         if has_request_context():
@@ -722,8 +776,18 @@ class Quart(App):
         if _scheme is not None and not _external:
             raise ValueError("External must be True for scheme usage")
 
-        self.inject_url_defaults(endpoint, values)
+        return endpoint, url_adapter, _external
 
+    def _build_url(
+        self,
+        url_adapter: MapAdapter,
+        endpoint: str,
+        values: dict[str, Any],
+        _anchor: str | None,
+        _external: bool,
+        _method: str | None,
+        _scheme: str | None,
+    ) -> str:
         old_scheme = None
         if _scheme is not None:
             old_scheme = url_adapter.url_scheme
@@ -743,6 +807,59 @@ class Quart(App):
             quoted_anchor = quote(_anchor, safe="%!#$&'()*+,/:;=?@")
             url = f"{url}#{quoted_anchor}"
         return url
+
+    def inject_url_defaults(self, endpoint: str, values: dict[str, Any]) -> None:
+        """Injects the URL defaults for the given endpoint directly into
+        the values dictionary passed.
+
+        This only supports synchronous url_default functions, see
+        :meth:`async_inject_url_defaults` for asynchronous support.
+        """
+        for name, func in self._url_default_functions(endpoint):
+            if iscoroutinefunction(func):
+                raise RuntimeError(
+                    f"The url_defaults function {func!r} (registered for "
+                    f"{name!r}) is asynchronous, use async_url_for instead "
+                    "of url_for."
+                )
+            result = func(endpoint, values)
+            if isawaitable(result):
+                if iscoroutine(result):
+                    result.close()
+                raise RuntimeError(
+                    f"The url_defaults function {func!r} (registered for "
+                    f"{name!r}) returned an awaitable, use async_url_for "
+                    "instead of url_for."
+                )
+
+    async def async_inject_url_defaults(
+        self, endpoint: str, values: dict[str, Any]
+    ) -> None:
+        """Injects the URL defaults for the given endpoint directly into
+        the values dictionary passed, awaiting async functions.
+
+        This supports both synchronous and asynchronous url_default
+        functions.
+        """
+        for _, func in self._url_default_functions(endpoint):
+            await self.ensure_async(func)(endpoint, values)
+
+    def _url_default_functions(
+        self, endpoint: str
+    ) -> Iterable[tuple[str | None, Callable]]:
+        names: Iterable[str | None] = (None,)
+
+        # url_for may be called outside a request context, parse the
+        # passed endpoint instead of using request.blueprints.
+        if "." in endpoint:
+            names = chain(
+                names, reversed(_split_blueprint_path(endpoint.rpartition(".")[0]))
+            )
+
+        for name in names:
+            if name in self.url_default_functions:
+                for func in self.url_default_functions[name]:
+                    yield name, func
 
     def make_shell_context(self) -> dict:
         """Create a context for interactive shell usage.
@@ -1542,7 +1659,9 @@ class Quart(App):
 
         for name in names:
             for processor in self.url_value_preprocessors[name]:
-                processor(ctx.request.endpoint, ctx.request.view_args)
+                await self.ensure_async(processor)(
+                    ctx.request.endpoint, ctx.request.view_args
+                )
 
         for name in names:
             for function in self.before_request_funcs[name]:
@@ -1566,7 +1685,9 @@ class Quart(App):
 
         for name in names:
             for processor in self.url_value_preprocessors[name]:
-                processor(ctx.websocket.endpoint, ctx.websocket.view_args)
+                await self.ensure_async(processor)(
+                    ctx.websocket.endpoint, ctx.websocket.view_args
+                )
 
         for name in names:
             for function in self.before_websocket_funcs[name]:

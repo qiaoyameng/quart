@@ -19,6 +19,7 @@ from .globals import request as request
 from .globals import session as session
 from .globals import websocket as websocket
 from .helpers import abort as abort
+from .helpers import async_url_for as async_url_for
 from .helpers import flash as flash
 from .helpers import get_flashed_messages as get_flashed_messages
 from .helpers import get_template_attribute as get_template_attribute

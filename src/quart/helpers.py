@@ -205,6 +205,40 @@ def url_for(
     )
 
 
+async def async_url_for(
+    endpoint: str,
+    *,
+    _anchor: str | None = None,
+    _external: bool | None = None,
+    _method: str | None = None,
+    _scheme: str | None = None,
+    **values: Any,
+) -> str:
+    """Return the url for a specific endpoint, awaiting url defaults.
+
+    This is the awaitable equivalent of :func:`url_for`, required if
+    any of the url_defaults functions are asynchronous.
+
+    Arguments:
+        endpoint: The endpoint to build a url for, if prefixed with
+            ``.`` it targets endpoint's in the current blueprint.
+        _anchor: Additional anchor text to append (i.e. #text).
+        _external: Return an absolute url for external (to app) usage.
+        _method: The method to consider alongside the endpoint.
+        _scheme: A specific scheme to use.
+        values: The values to build into the URL, as specified in
+            the endpoint rule.
+    """
+    return await current_app.async_url_for(
+        endpoint,
+        _anchor=_anchor,
+        _method=_method,
+        _scheme=_scheme,
+        _external=_external,
+        **values,
+    )
+
+
 def stream_with_context(func: Callable) -> Callable:
     """Share the current request context with a generator.
 

@@ -1,3 +1,10 @@
+## Unreleased
+
+- Support asynchronous url_value_preprocessor functions and add an
+  awaitable async_url_for (with async url_defaults support). The
+  synchronous url_for now raises a clear error if an asynchronous
+  url_defaults function is registered.
+
 ## Version 0.23.1
 
 Released 2026-08-29
