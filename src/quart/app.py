@@ -40,6 +40,7 @@ from werkzeug.exceptions import Aborter
 from werkzeug.exceptions import BadRequestKeyError
 from werkzeug.exceptions import HTTPException
 from werkzeug.exceptions import InternalServerError
+from werkzeug.exceptions import NotAcceptable
 from werkzeug.routing import BuildError
 from werkzeug.routing import MapAdapter
 from werkzeug.routing import RoutingException
@@ -49,6 +50,7 @@ from .asgi import ASGIHTTPConnection
 from .asgi import ASGILifespan
 from .asgi import ASGIWebsocketConnection
 from .cli import AppGroup
+from .compression import compress_response
 from .config import Config
 from .ctx import _AppCtxGlobals
 from .ctx import AppContext
@@ -237,6 +239,8 @@ class Quart(App):
             "PRESERVE_CONTEXT_ON_EXCEPTION": None,
             "PROPAGATE_EXCEPTIONS": None,
             "PROVIDE_AUTOMATIC_OPTIONS": True,
+            "RESPONSE_COMPRESSION": False,
+            "RESPONSE_COMPRESSION_MIN_SIZE": 500,
             "RESPONSE_TIMEOUT": 60,  # Second
             "SECRET_KEY": None,
             "SECRET_KEY_FALLBACKS": None,
@@ -1695,6 +1699,18 @@ class Quart(App):
             await self.ensure_async(self.session_interface.save_session)(
                 self, session_, response
             )
+
+        if self.config["RESPONSE_COMPRESSION"] and isinstance(response, Response):
+            try:
+                response = compress_response(
+                    ctx.request,
+                    response,
+                    min_size=self.config["RESPONSE_COMPRESSION_MIN_SIZE"],
+                )
+            except NotAcceptable as error:
+                response = await self.make_response(
+                    await self.handle_user_exception(ctx, error)
+                )
         return response
 
     async def postprocess_websocket(
