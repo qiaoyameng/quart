@@ -1,3 +1,10 @@
+## Unreleased
+
+- Add optional gzip response compression, enabled via the
+  `RESPONSE_COMPRESSION` config and controlled by
+  `RESPONSE_COMPRESSION_MIN_SIZE`. The response is compressed as it
+  streams based on the request's Accept-Encoding header.
+
 ## Version 0.23.1
 
 Released 2026-08-29

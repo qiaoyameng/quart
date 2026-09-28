@@ -49,6 +49,8 @@ from .asgi import ASGIHTTPConnection
 from .asgi import ASGILifespan
 from .asgi import ASGIWebsocketConnection
 from .cli import AppGroup
+from .compression import compress_response
+from .compression import should_compress_response
 from .config import Config
 from .ctx import _AppCtxGlobals
 from .ctx import AppContext
@@ -237,6 +239,8 @@ class Quart(App):
             "PRESERVE_CONTEXT_ON_EXCEPTION": None,
             "PROPAGATE_EXCEPTIONS": None,
             "PROVIDE_AUTOMATIC_OPTIONS": True,
+            "RESPONSE_COMPRESSION": False,
+            "RESPONSE_COMPRESSION_MIN_SIZE": 500,  # Bytes
             "RESPONSE_TIMEOUT": 60,  # Second
             "SECRET_KEY": None,
             "SECRET_KEY_FALLBACKS": None,
@@ -1635,6 +1639,11 @@ class Quart(App):
             if not from_error_handler:
                 raise
             self.logger.exception("Request finalizing errored")
+        if self.config["RESPONSE_COMPRESSION"] and isinstance(response, Response):
+            if should_compress_response(
+                ctx.request, response, self.config["RESPONSE_COMPRESSION_MIN_SIZE"]
+            ):
+                compress_response(response)
         return response
 
     async def finalize_websocket(
