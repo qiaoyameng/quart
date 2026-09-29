@@ -37,6 +37,9 @@ if TYPE_CHECKING:
 
 _no_app_msg = "Not within an app context"
 _cv_app: ContextVar[AppContext] = ContextVar("quart.app_ctx")
+_cv_sub_request_depth: ContextVar[int] = ContextVar(
+    "quart.sub_request_depth", default=0
+)
 app_ctx: AppContextProxy = LocalProxy(  # type: ignore[assignment]
     _cv_app, unbound_message=_no_app_msg
 )

@@ -22,6 +22,7 @@ from typing import overload
 from typing import ParamSpec
 from typing import TypeVar
 from urllib.parse import quote
+from urllib.parse import unquote
 
 from aiofiles import open as async_open
 from aiofiles.base import AiofilesContextManager
@@ -55,6 +56,7 @@ from .ctx import AppContext
 from .ctx import has_request_context
 from .ctx import has_websocket_context
 from .globals import _cv_app
+from .globals import _cv_sub_request_depth
 from .globals import g
 from .globals import request
 from .globals import session
@@ -250,6 +252,7 @@ class Quart(App):
             "SESSION_COOKIE_SAMESITE": None,
             "SESSION_COOKIE_SECURE": False,
             "SESSION_REFRESH_EACH_REQUEST": True,
+            "SUBREQUEST_MAX_DEPTH": 3,
             "TEMPLATES_AUTO_RELOAD": None,
             "TESTING": False,
             "TRAP_BAD_REQUEST_ERRORS": None,
@@ -1491,6 +1494,124 @@ class Quart(App):
             finally:
                 if websocket.scope.get("_quart._preserve_context", False):
                     self._preserved_context = ctx.copy()
+
+    async def sub_request(
+        self,
+        path: str,
+        *,
+        method: str = "GET",
+        headers: dict | Headers | None = None,
+        data: str | bytes | None = None,
+        forward_cookies: bool = False,
+    ) -> ResponseTypes:
+        """Dispatch a sub-request directly within this process.
+
+        This allows a view (or any code within a context) to make an
+        internal request to this same app without going over the
+        network. The sub-request is fully dispatched, i.e. it passes
+        through routing, before/after request functions, error
+        handling, and teardown functions, and the complete response
+        (with the body fully consumed) is returned.
+
+        The sub-request runs in its own context, with its own
+        ``request``, ``g``, and ``session`` objects, so any changes
+        made by the sub-request do not affect the current (outer)
+        context. Cookies from the current request are only forwarded
+        if ``forward_cookies`` is True.
+
+        Sub-requests may themselves make sub-requests, up to
+        ``SUBREQUEST_MAX_DEPTH`` levels of nesting. If the current
+        task is cancelled the sub-request's context and any streaming
+        response generator are closed.
+
+        Arguments:
+            path: The path to request, optionally including a query
+                string.
+            method: The HTTP verb to use, defaults to GET.
+            headers: Headers to include in the sub-request.
+            data: The request body to send.
+            forward_cookies: Forward the current request's cookies to
+                the sub-request. Defaults to False, i.e. no cookies
+                are forwarded unless explicitly given in ``headers``.
+        """
+        depth = _cv_sub_request_depth.get()
+        max_depth = self.config["SUBREQUEST_MAX_DEPTH"]
+        if depth >= max_depth:
+            raise RuntimeError(
+                f"Sub-request maximum depth of {max_depth} has been reached"
+            )
+
+        if headers is None:
+            headers = Headers()
+        elif not isinstance(headers, Headers):
+            headers = Headers(headers)
+
+        if forward_cookies and "cookie" not in headers:
+            outer_ctx = _cv_app.get(None)
+            if outer_ctx is not None and outer_ctx.has_request:
+                cookie_header = outer_ctx.request.headers.get("cookie")
+                if cookie_header is not None:
+                    headers["cookie"] = cookie_header
+
+        headers.setdefault("host", self.config["SERVER_NAME"] or "localhost")
+
+        path, _, query_string_raw = path.partition("?")
+        path = unquote(path)
+        query_string_bytes = query_string_raw.encode("ascii")
+
+        body = b""
+        if isinstance(data, str):
+            body = data.encode("utf-8")
+        elif data is not None:
+            body = data
+        if body:
+            headers.setdefault("content-length", str(len(body)))
+
+        scope = make_test_scope(
+            "http",
+            path,
+            method,
+            headers,
+            query_string_bytes,
+            "http",
+            "",
+            "1.1",
+            None,
+        )
+        request = self.request_class(
+            method,
+            "http",
+            path,
+            query_string_bytes,
+            headers,
+            "",
+            "1.1",
+            max_content_length=self.config["MAX_CONTENT_LENGTH"],
+            body_timeout=self.config["BODY_TIMEOUT"],
+            send_push_promise=no_op_push,
+            scope=scope,
+        )
+        request.body.set_result(body)
+
+        token = _cv_sub_request_depth.set(depth + 1)
+        try:
+            async with self.request_context(request) as ctx:
+                try:
+                    response = await self.full_dispatch_request(ctx)
+                except asyncio.CancelledError:
+                    raise  # CancelledErrors should be handled by serving code.
+                except Exception as error:
+                    response = await self.handle_exception(ctx, error)
+                # Consume the body within the sub-request context so
+                # that streaming views see this context and so that
+                # the generator is closed if this task is cancelled.
+                if isinstance(response, Response):
+                    response.set_data(await response.get_data(as_text=False))
+                elif isinstance(response, WerkzeugResponse):
+                    response.set_data(response.get_data())
+                return response
+        finally:
+            _cv_sub_request_depth.reset(token)
 
     async def full_dispatch_request(self, ctx: AppContext) -> ResponseTypes:
         """Adds pre and post processing to the request dispatching.

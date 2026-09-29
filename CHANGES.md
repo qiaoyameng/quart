@@ -1,3 +1,13 @@
+## Unreleased
+
+- Add `Quart.sub_request` (and the `quart.sub_request` helper) to
+  dispatch an internal sub-request directly within the process,
+  without going over the network. The sub-request passes through
+  routing, request hooks, and error handling, runs in an isolated
+  context (its own `request`, `g`, and `session`), only forwards
+  cookies when `forward_cookies=True`, and may be nested up to
+  `SUBREQUEST_MAX_DEPTH` levels.
+
 ## Version 0.23.1
 
 Released 2026-08-29

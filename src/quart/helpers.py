@@ -20,6 +20,7 @@ from typing import NoReturn
 from zlib import adler32
 
 from flask.helpers import get_root_path as get_root_path  # noqa: F401
+from werkzeug.datastructures import Headers
 from werkzeug.exceptions import abort as werkzeug_abort
 from werkzeug.exceptions import NotFound
 from werkzeug.utils import redirect as werkzeug_redirect
@@ -84,6 +85,35 @@ async def make_response(*args: Any) -> ResponseTypes:
         args = args[0]
 
     return await current_app.make_response(cast(ResponseReturnValue, args))
+
+
+async def sub_request(
+    path: str,
+    *,
+    method: str = "GET",
+    headers: dict | Headers | None = None,
+    data: str | bytes | None = None,
+    forward_cookies: bool = False,
+) -> ResponseTypes:
+    """Dispatch a sub-request to the current app, a simple wrapper.
+
+    This makes an internal request to the current app without going
+    over the network, for example
+
+    .. code-block:: python
+
+        response = await sub_request("/api/data", method="GET")
+        data = await response.get_data()
+
+    See :meth:`quart.Quart.sub_request` for full details.
+    """
+    return await current_app.sub_request(
+        path,
+        method=method,
+        headers=headers,
+        data=data,
+        forward_cookies=forward_cookies,
+    )
 
 
 async def make_push_promise(path: str) -> None:

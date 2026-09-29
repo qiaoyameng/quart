@@ -28,6 +28,7 @@ from .helpers import redirect as redirect
 from .helpers import send_file as send_file
 from .helpers import send_from_directory as send_from_directory
 from .helpers import stream_with_context as stream_with_context
+from .helpers import sub_request as sub_request
 from .helpers import url_for as url_for
 from .json import jsonify as jsonify
 from .signals import appcontext_popped as appcontext_popped
