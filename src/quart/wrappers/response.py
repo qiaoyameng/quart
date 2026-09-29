@@ -5,8 +5,12 @@ from abc import abstractmethod
 from collections.abc import AsyncGenerator
 from collections.abc import AsyncIterable
 from collections.abc import AsyncIterator
+from collections.abc import Awaitable
+from collections.abc import Callable
 from collections.abc import Iterable
+from dataclasses import dataclass
 from hashlib import md5
+from inspect import isawaitable
 from io import BytesIO
 from os import PathLike
 from types import TracebackType
@@ -26,12 +30,43 @@ from werkzeug.sansio.http import is_resource_modified
 from werkzeug.sansio.response import Response as SansIOResponse
 
 from .. import json
+from ..globals import _cv_app
 from ..globals import current_app
 from ..utils import file_path_to_path
 from ..utils import run_sync_iterable
 
 if TYPE_CHECKING:
     from .request import Request
+
+ResponseCompletionState = Literal["completed", "disconnected", "error"]
+
+
+@dataclass
+class ResponseCompletion:
+    """The terminal result of sending a response to the client.
+
+    This is passed to the callbacks registered via
+    :meth:`Response.add_completion_callback` once the response has
+    finished being sent.
+
+    Attributes:
+        bytes_sent: The number of body bytes successfully passed to
+            the ASGI ``send`` callable. A chunk whose send failed is
+            not included.
+        state: The terminal state, ``"completed"`` if the body was
+            fully sent, ``"disconnected"`` if the client disconnected
+            (or the send was otherwise interrupted), or ``"error"``
+            if the body itself raised an exception.
+        error: The exception that prevented completion, or None if
+            the response completed.
+    """
+
+    bytes_sent: int
+    state: ResponseCompletionState
+    error: BaseException | None = None
+
+
+ResponseCompletionCallback = Callable[[ResponseCompletion], Awaitable[None] | None]
 
 
 class ResponseBody(ABC):
@@ -291,6 +326,9 @@ class Response(SansIOResponse):
         super().__init__(status, headers, mimetype, content_type)
         self.timeout: Any = Ellipsis
 
+        self._completion_callbacks: list[ResponseCompletionCallback] = []
+        self._completion_notified = False
+
         self.response: ResponseBody
         if response is None:
             self.response = self.iterable_body_class([])
@@ -307,6 +345,48 @@ class Response(SansIOResponse):
             return current_app.config["MAX_COOKIE_SIZE"]
 
         return super().max_cookie_size
+
+    def add_completion_callback(
+        self, callback: ResponseCompletionCallback
+    ) -> ResponseCompletionCallback:
+        """Register a *callback* to be called when this response has
+        finished being sent to the client.
+
+        The callback (which may be sync or async) is called with a
+        :class:`ResponseCompletion` detailing how many body bytes were
+        actually passed to the ASGI server and the terminal state
+        (completed, disconnected, or error). It is called within the
+        original request context, but only after the headers and body
+        have been sent - it therefore cannot alter the headers or
+        write additional body data.
+
+        Each response notifies its callbacks at most once, and any
+        error raised by a callback is logged and suppressed so that it
+        cannot mask an error that occurred whilst sending.
+        """
+        self._completion_callbacks.append(callback)
+        return callback
+
+    async def notify_completion(self, completion: ResponseCompletion) -> None:
+        """Notify the registered completion callbacks, at most once.
+
+        This is called by the ASGI serving layer once the response
+        body has been fully sent, or sending has failed. Subsequent
+        calls for the same response are ignored.
+        """
+        if self._completion_notified:
+            return
+        self._completion_notified = True
+        for callback in self._completion_callbacks:
+            try:
+                result = callback(completion)
+                if isawaitable(result):
+                    await result
+            except Exception:
+                if _cv_app.get(None) is not None:
+                    current_app.logger.exception(
+                        "Error in response completion callback"
+                    )
 
     @overload
     async def get_data(self, as_text: Literal[True]) -> str: ...

@@ -36,6 +36,8 @@ from .wrappers import Request  # noqa: F401
 from .wrappers import Response  # noqa: F401
 from .wrappers import Websocket  # noqa: F401
 from .wrappers.base import ClientDisconnectedError
+from .wrappers.response import ResponseCompletion
+from .wrappers.response import ResponseCompletionState
 
 if TYPE_CHECKING:
     from .app import Quart  # noqa: F401
@@ -112,38 +114,37 @@ class ASGIHTTPConnection:
         else:
             timeout = self.app.config["RESPONSE_TIMEOUT"]
         try:
-            await asyncio.wait_for(self._send_response(send, response), timeout=timeout)
+            await asyncio.wait_for(
+                self._send_response(send, response, request), timeout=timeout
+            )
         except TimeoutError:
             pass
 
     async def _send_response(
-        self, send: ASGISendCallable, response: ResponseTypes
+        self,
+        send: ASGISendCallable,
+        response: ResponseTypes,
+        request: Request | None = None,
     ) -> None:
-        if self._disconnected:
-            raise ClientDisconnectedError()
-        await send(
-            cast(
-                HTTPResponseStartEvent,
-                {
-                    "type": "http.response.start",
-                    "status": response.status_code,
-                    "headers": encode_headers(response.headers),
-                },
-            )
-        )
-
-        if isinstance(response, WerkzeugResponse):
-            for data in response.response:
-                body = data.encode() if isinstance(data, str) else data
-                await send(
-                    cast(
-                        HTTPResponseBodyEvent,
-                        {"type": "http.response.body", "body": body, "more_body": True},
-                    )
+        bytes_sent = 0
+        state: ResponseCompletionState = "completed"
+        error: BaseException | None = None
+        try:
+            if self._disconnected:
+                raise ClientDisconnectedError()
+            await send(
+                cast(
+                    HTTPResponseStartEvent,
+                    {
+                        "type": "http.response.start",
+                        "status": response.status_code,
+                        "headers": encode_headers(response.headers),
+                    },
                 )
-        else:
-            async with response.response as response_body:
-                async for data in response_body:
+            )
+
+            if isinstance(response, WerkzeugResponse):
+                for data in response.response:
                     body = data.encode() if isinstance(data, str) else data
                     await send(
                         cast(
@@ -155,12 +156,66 @@ class ASGIHTTPConnection:
                             },
                         )
                     )
-        await send(
-            cast(
-                HTTPResponseBodyEvent,
-                {"type": "http.response.body", "body": b"", "more_body": False},
+                    bytes_sent += len(body)
+            else:
+                async with response.response as response_body:
+                    async for data in response_body:
+                        body = data.encode() if isinstance(data, str) else data
+                        await send(
+                            cast(
+                                HTTPResponseBodyEvent,
+                                {
+                                    "type": "http.response.body",
+                                    "body": body,
+                                    "more_body": True,
+                                },
+                            )
+                        )
+                        bytes_sent += len(body)
+            await send(
+                cast(
+                    HTTPResponseBodyEvent,
+                    {"type": "http.response.body", "body": b"", "more_body": False},
+                )
             )
-        )
+        except ClientDisconnectedError as exception:
+            state = "disconnected"
+            error = exception
+            raise
+        except asyncio.CancelledError as exception:
+            state = "disconnected"
+            error = exception
+            raise
+        except BaseException as exception:
+            state = "error"
+            error = exception
+            raise
+        finally:
+            if isinstance(response, Response):
+                await self._notify_completion(
+                    request,
+                    response,
+                    ResponseCompletion(bytes_sent, state, error),
+                )
+
+    async def _notify_completion(
+        self,
+        request: Request | None,
+        response: Response,
+        completion: ResponseCompletion,
+    ) -> None:
+        if not response._completion_callbacks or response._completion_notified:
+            return
+        try:
+            if request is not None:
+                async with self.app.request_context(request):
+                    await response.notify_completion(completion)
+            else:
+                await response.notify_completion(completion)
+        except Exception:
+            # The callbacks must never mask an error raised whilst
+            # sending the response.
+            self.app.logger.exception("Error whilst notifying response completion")
 
     async def _send_push_promise(
         self, send: ASGISendCallable, path: str, headers: Headers

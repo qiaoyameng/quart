@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncGenerator
 from unittest.mock import AsyncMock
 from unittest.mock import Mock
 
@@ -11,7 +12,12 @@ from hypercorn.typing import HTTPScope
 from hypercorn.typing import WebsocketScope
 from werkzeug.datastructures import Headers
 
+from quart import ClientDisconnectedError
 from quart import Quart
+from quart import request
+from quart import Response
+from quart import ResponseCompletion
+from quart.asgi import _convert_os_error
 from quart.asgi import _convert_version
 from quart.asgi import _handle_exception
 from quart.asgi import ASGIHTTPConnection
@@ -351,3 +357,202 @@ async def test__handle_exception(debug: bool, testing: bool, raises: bool) -> No
             await _handle_exception(app, ValueError())
     else:
         await _handle_exception(app, ValueError())
+
+
+def _completion_scope(method: str = "GET") -> HTTPScope:
+    return {
+        "type": "http",
+        "asgi": {},
+        "http_version": "1.1",
+        "method": method,
+        "scheme": "https",
+        "path": "/",
+        "raw_path": b"/",
+        "query_string": b"",
+        "root_path": "",
+        "headers": [(b"host", b"quart")],
+        "client": ("127.0.0.1", 80),
+        "server": None,
+        "extensions": {},
+        "state": {},  # type: ignore[typeddict-item]
+    }
+
+
+class _ChunkedSend:
+    """A send callable that records messages and fails on a chosen body chunk."""
+
+    def __init__(self, fail_at: int | None = None) -> None:
+        self.fail_at = fail_at
+        self.messages: list[ASGISendEvent] = []
+        self._body_chunks = 0
+
+    async def __call__(self, message: ASGISendEvent) -> None:
+        self.messages.append(message)
+        if message["type"] == "http.response.body":
+            chunk = self._body_chunks
+            self._body_chunks += 1
+            if chunk == self.fail_at:
+                raise OSError("Client disconnected")
+
+
+async def test_response_completion_completed() -> None:
+    app = Quart(__name__)
+    completions = []
+    seen_paths = []
+
+    @app.route("/")
+    async def index() -> Response:
+        async def body() -> AsyncGenerator[bytes, None]:
+            yield b"abc"
+            yield b"de"
+
+        response = Response(body())
+
+        @response.add_completion_callback
+        def record(completion: ResponseCompletion) -> None:
+            completions.append(completion)
+            # The original request context must be available
+            seen_paths.append(request.path)
+
+        return response
+
+    test_client = app.test_client()
+    response = await test_client.get("/")
+    assert await response.get_data() == b"abcde"
+    assert completions == [
+        ResponseCompletion(bytes_sent=5, state="completed", error=None)
+    ]
+    assert seen_paths == ["/"]
+
+
+async def test_response_completion_head_request() -> None:
+    app = Quart(__name__)
+    completions = []
+
+    @app.route("/")
+    async def index() -> Response:
+        response = Response(b"data")
+        response.add_completion_callback(completions.append)
+        return response
+
+    test_client = app.test_client()
+    await test_client.head("/")
+    assert len(completions) == 1
+    assert completions[0].state == "completed"
+    assert completions[0].bytes_sent == 4
+
+
+async def test_response_completion_empty_response() -> None:
+    app = Quart(__name__)
+    completions = []
+
+    @app.route("/")
+    async def index() -> Response:
+        response = Response(b"")
+        response.add_completion_callback(completions.append)
+        return response
+
+    test_client = app.test_client()
+    await test_client.get("/")
+    assert completions == [
+        ResponseCompletion(bytes_sent=0, state="completed", error=None)
+    ]
+
+
+async def test_response_completion_send_failure() -> None:
+    app = Quart(__name__)
+    connection = ASGIHTTPConnection(app, _completion_scope())
+    request_ = connection._create_request_from_scope(lambda: None)  # type: ignore
+
+    closed = False
+
+    async def body() -> AsyncGenerator[bytes, None]:
+        nonlocal closed
+        try:
+            yield b"aaa"
+            yield b"bbb"
+            yield b"ccc"
+        finally:
+            closed = True
+
+    response = Response(body())
+    completions = []
+    response.add_completion_callback(completions.append)
+
+    send = _ChunkedSend(fail_at=1)  # Fail sending the second chunk
+    with pytest.raises(ClientDisconnectedError):
+        await connection._send_response(_convert_os_error(send), response, request_)
+
+    assert len(completions) == 1
+    completion = completions[0]
+    assert completion.state == "disconnected"
+    # The failed chunk must not be counted as sent
+    assert completion.bytes_sent == 3
+    # The body iterator must have been closed
+    assert closed
+
+
+async def test_response_completion_body_exception() -> None:
+    app = Quart(__name__)
+    connection = ASGIHTTPConnection(app, _completion_scope())
+    request_ = connection._create_request_from_scope(lambda: None)  # type: ignore
+
+    closed = False
+
+    async def body() -> AsyncGenerator[bytes, None]:
+        nonlocal closed
+        try:
+            yield b"aaa"
+            yield b"bbb"
+            raise RuntimeError("Body failed")
+        finally:
+            closed = True
+
+    response = Response(body())
+    completions = []
+    response.add_completion_callback(completions.append)
+
+    with pytest.raises(RuntimeError):
+        await connection._send_response(_ChunkedSend(), response, request_)
+
+    assert len(completions) == 1
+    completion = completions[0]
+    assert completion.state == "error"
+    assert isinstance(completion.error, RuntimeError)
+    assert completion.bytes_sent == 6
+    # The body iterator must have been closed
+    assert closed
+
+
+async def test_response_completion_callback_error_does_not_mask_send_error() -> None:
+    app = Quart(__name__)
+    connection = ASGIHTTPConnection(app, _completion_scope())
+    request_ = connection._create_request_from_scope(lambda: None)  # type: ignore
+
+    calls = []
+
+    def callback(completion: ResponseCompletion) -> None:
+        calls.append(completion)
+        raise ValueError("Callback error")
+
+    response = Response(b"data")
+    response.add_completion_callback(callback)
+
+    send = _ChunkedSend(fail_at=0)
+    with pytest.raises(ClientDisconnectedError):
+        await connection._send_response(_convert_os_error(send), response, request_)
+
+    assert len(calls) == 1
+    assert calls[0].state == "disconnected"
+    assert calls[0].bytes_sent == 0
+
+
+async def test_response_completion_notified_once() -> None:
+    response = Response(b"data")
+    completions = []
+    response.add_completion_callback(completions.append)
+
+    completion = ResponseCompletion(bytes_sent=4, state="completed")
+    await response.notify_completion(completion)
+    await response.notify_completion(ResponseCompletion(bytes_sent=0, state="error"))
+    assert completions == [completion]

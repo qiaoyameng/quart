@@ -60,6 +60,39 @@ the timeout attribute on a specific response to ``None``,
         response.timeout = None  # No timeout for this route
         return response
 
+Completion callbacks
+--------------------
+
+As the response body is streamed after the ``after_request`` functions
+have run, they cannot tell you whether the response was completely
+sent to the client. Instead a completion callback can be registered on
+the response, which is called (within the original request context)
+once sending has finished. The callback receives a
+:class:`~quart.ResponseCompletion` detailing how many body bytes were
+actually passed to the ASGI server and the terminal state -
+``"completed"``, ``"disconnected"``, or ``"error"``,
+
+.. code-block:: python
+
+    from quart import make_response
+
+    @app.route('/export')
+    async def export():
+        response = await make_response(async_generator())
+
+        @response.add_completion_callback
+        async def log_completion(completion):
+            current_app.logger.info(
+                "Export %s after %d bytes", completion.state, completion.bytes_sent
+            )
+
+        return response
+
+The callback runs after the headers and body have been sent, so it
+cannot alter them. Each response notifies its callbacks at most once,
+and any error raised by a callback is logged and suppressed so that it
+cannot mask an error that occurred whilst sending.
+
 Testing
 -------
 

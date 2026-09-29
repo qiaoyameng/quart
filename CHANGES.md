@@ -1,3 +1,11 @@
+## Unreleased
+
+- Add response completion callbacks, registered via
+  ``Response.add_completion_callback``. These are called once the
+  response has finished being sent, with the number of body bytes
+  actually passed to the ASGI server and the terminal state
+  (completed, disconnected, or error).
+
 ## Version 0.23.1
 
 Released 2026-08-29
