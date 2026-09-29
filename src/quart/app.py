@@ -250,6 +250,7 @@ class Quart(App):
             "SESSION_COOKIE_SAMESITE": None,
             "SESSION_COOKIE_SECURE": False,
             "SESSION_REFRESH_EACH_REQUEST": True,
+            "SUBREQUEST_MAX_DEPTH": 5,
             "TEMPLATES_AUTO_RELOAD": None,
             "TESTING": False,
             "TRAP_BAD_REQUEST_ERRORS": None,
@@ -1491,6 +1492,133 @@ class Quart(App):
             finally:
                 if websocket.scope.get("_quart._preserve_context", False):
                     self._preserved_context = ctx.copy()
+
+    async def subrequest(
+        self,
+        path: str,
+        *,
+        method: str = "GET",
+        headers: dict | Headers | None = None,
+        data: str | bytes | None = None,
+        query_string: dict | None = None,
+        forward_cookies: bool = False,
+    ) -> Response:
+        """Make a subrequest to this application without any network IO.
+
+        This dispatches a request through the normal routing, request
+        hooks, and exception handling, returning the complete
+        response. It is useful for aggregation endpoints that need to
+        combine the results of other endpoints in the same app.
+
+        The subrequest runs in its own task with its own contexts, so
+        any changes it makes to ``request``, ``g``, or ``session`` do
+        not affect the enclosing request. Cookies are only forwarded
+        if ``forward_cookies`` is True.
+
+        Subrequests may themselves make subrequests, up to the
+        ``SUBREQUEST_MAX_DEPTH`` config limit. If the enclosing
+        request is cancelled the subrequest is cancelled as well,
+        closing its contexts and any response generators.
+
+        Arguments:
+            path: The path to request, optionally including a query
+                string.
+            method: The HTTP verb to use.
+            headers: Headers to include in the request.
+            data: The raw request body to send.
+            query_string: To send as a dictionary, alternatively the
+                query_string can be determined from the path.
+            forward_cookies: Forward the current request's cookies to
+                the subrequest. Defaults to False.
+
+        .. versionadded:: 0.24
+        """
+        ctx = _cv_app.get(None)
+        outer_request = ctx._request if ctx is not None else None
+
+        depth = 0
+        if outer_request is not None:
+            depth = outer_request.scope.get("_quart.subrequest_depth", 0)
+        depth += 1
+        max_depth = self.config["SUBREQUEST_MAX_DEPTH"]
+        if depth > max_depth:
+            raise RuntimeError(f"Subrequest depth limit ({max_depth}) exceeded")
+
+        if headers is None:
+            headers = Headers()
+        elif not isinstance(headers, Headers):
+            headers = Headers(headers)
+        if outer_request is not None:
+            headers.setdefault("host", outer_request.host)
+            if forward_cookies and "cookie" not in headers:
+                cookie = outer_request.headers.get("Cookie")
+                if cookie is not None:
+                    headers["Cookie"] = cookie
+
+        headers, path, query_string_bytes = make_test_headers_path_and_query_string(
+            self, path, headers, query_string
+        )
+        request_body, body_headers = make_test_body_with_headers(data=data)
+        headers.update(**body_headers)
+
+        scheme = outer_request.scheme if outer_request is not None else "http"
+        root_path = outer_request.root_path if outer_request is not None else ""
+        http_version = (
+            outer_request.http_version if outer_request is not None else "1.1"
+        )
+        scope = make_test_scope(
+            "http",
+            path,
+            method,
+            headers,
+            query_string_bytes,
+            scheme,
+            root_path,
+            http_version,
+            None,
+        )
+        scope["_quart.subrequest_depth"] = depth
+        sub_request = self.request_class(
+            method,
+            scheme,
+            path,
+            query_string_bytes,
+            headers,
+            root_path,
+            http_version,
+            max_content_length=self.config["MAX_CONTENT_LENGTH"],
+            body_timeout=self.config["BODY_TIMEOUT"],
+            send_push_promise=no_op_push,
+            scope=scope,
+        )
+        sub_request.body.set_result(request_body)
+
+        # A separate task ensures the subrequest's contexts (and
+        # hence request, g, and session) are independent of this
+        # request's contexts.
+        task = asyncio.ensure_future(self._subrequest_dispatch(sub_request))
+        try:
+            return await task
+        except asyncio.CancelledError:
+            # Ensure the subrequest's contexts and response generators
+            # are closed before propagating the cancellation.
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            raise
+
+    async def _subrequest_dispatch(self, request: Request) -> Response:
+        response = await self.handle_request(request)
+        if isinstance(response, Response):
+            # Consume the body so that the returned response is
+            # complete and any response generators are closed.
+            response.set_data(await response.get_data(as_text=False))
+            return response
+        return self.response_class(
+            response.get_data(), response.status, response.headers
+        )
 
     async def full_dispatch_request(self, ctx: AppContext) -> ResponseTypes:
         """Adds pre and post processing to the request dispatching.

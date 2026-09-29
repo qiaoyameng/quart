@@ -1,3 +1,14 @@
+## Version 0.24.0
+
+Unreleased
+
+- Add `Quart.subrequest` to dispatch a request within the app without
+  any network IO. The subrequest runs through the normal routing,
+  hooks, and exception handling in its own task and contexts (so
+  `request`, `g`, and `session` changes cannot leak), with cookie
+  forwarding opt-in via `forward_cookies` and nesting limited by the
+  `SUBREQUEST_MAX_DEPTH` config.
+
 ## Version 0.23.1
 
 Released 2026-08-29
