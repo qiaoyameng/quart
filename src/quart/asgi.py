@@ -28,6 +28,7 @@ from werkzeug.datastructures import Headers
 from werkzeug.wrappers import Response as WerkzeugResponse
 
 from .debug import traceback_response
+from .globals import _cv_app
 from .signals import websocket_received
 from .signals import websocket_sent
 from .typing import ResponseTypes
@@ -36,6 +37,7 @@ from .wrappers import Request  # noqa: F401
 from .wrappers import Response  # noqa: F401
 from .wrappers import Websocket  # noqa: F401
 from .wrappers.base import ClientDisconnectedError
+from .wrappers.response import ResponseSendResult
 
 if TYPE_CHECKING:
     from .app import Quart  # noqa: F401
@@ -119,31 +121,23 @@ class ASGIHTTPConnection:
     async def _send_response(
         self, send: ASGISendCallable, response: ResponseTypes
     ) -> None:
-        if self._disconnected:
-            raise ClientDisconnectedError()
-        await send(
-            cast(
-                HTTPResponseStartEvent,
-                {
-                    "type": "http.response.start",
-                    "status": response.status_code,
-                    "headers": encode_headers(response.headers),
-                },
-            )
-        )
-
-        if isinstance(response, WerkzeugResponse):
-            for data in response.response:
-                body = data.encode() if isinstance(data, str) else data
-                await send(
-                    cast(
-                        HTTPResponseBodyEvent,
-                        {"type": "http.response.body", "body": body, "more_body": True},
-                    )
+        result = ResponseSendResult(bytes_sent=0, state="error")
+        try:
+            if self._disconnected:
+                raise ClientDisconnectedError()
+            await send(
+                cast(
+                    HTTPResponseStartEvent,
+                    {
+                        "type": "http.response.start",
+                        "status": response.status_code,
+                        "headers": encode_headers(response.headers),
+                    },
                 )
-        else:
-            async with response.response as response_body:
-                async for data in response_body:
+            )
+
+            if isinstance(response, WerkzeugResponse):
+                for data in response.response:
                     body = data.encode() if isinstance(data, str) else data
                     await send(
                         cast(
@@ -155,12 +149,67 @@ class ASGIHTTPConnection:
                             },
                         )
                     )
-        await send(
-            cast(
-                HTTPResponseBodyEvent,
-                {"type": "http.response.body", "body": b"", "more_body": False},
+                    result.bytes_sent += len(body)
+            else:
+                async with response.response as response_body:
+                    async for data in response_body:
+                        body = data.encode() if isinstance(data, str) else data
+                        await send(
+                            cast(
+                                HTTPResponseBodyEvent,
+                                {
+                                    "type": "http.response.body",
+                                    "body": body,
+                                    "more_body": True,
+                                },
+                            )
+                        )
+                        result.bytes_sent += len(body)
+            await send(
+                cast(
+                    HTTPResponseBodyEvent,
+                    {"type": "http.response.body", "body": b"", "more_body": False},
+                )
             )
-        )
+            result.state = "complete"
+        except ClientDisconnectedError as error:
+            result.state = "disconnected"
+            result.error = error
+            raise
+        except asyncio.CancelledError as error:
+            # Cancellation occurs on client disconnect or timeout.
+            result.state = "disconnected"
+            result.error = error
+            raise
+        except Exception as error:
+            result.state = "error"
+            result.error = error
+            raise
+        finally:
+            await self._notify_complete(response, result)
+
+    async def _notify_complete(
+        self, response: ResponseTypes, result: ResponseSendResult
+    ) -> None:
+        if not isinstance(response, Response):
+            return
+        try:
+            context = response._request_context
+            if context is not None:
+                # Activate the original request context so that the
+                # callbacks can access it. The context variable is set
+                # directly to avoid re-running any teardown logic.
+                token = _cv_app.set(context)
+                try:
+                    await response.notify_complete(result)
+                finally:
+                    _cv_app.reset(token)
+            else:
+                await response.notify_complete(result)
+        except Exception:
+            # A callback error must not mask any exception raised
+            # whilst sending the response.
+            self.app.logger.exception("Response completion callback errored")
 
     async def _send_push_promise(
         self, send: ASGISendCallable, path: str, headers: Headers

@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     from .app import Quart
     from .sessions import SessionMixin
     from .wrappers.response import Response  # noqa: F401
+    from .wrappers.response import ResponseSendResult  # noqa: F401
 
 FilePath = bytes | str | os.PathLike
 
@@ -76,6 +77,7 @@ AfterRequestCallable = (
     | Callable[[ResponseTypes], Awaitable[ResponseTypes]]
 )
 AfterServingCallable = Callable[[], None] | Callable[[], Awaitable[None]]
+ResponseCompleteCallable = Callable[["ResponseSendResult"], Awaitable[None]]
 AfterWebsocketCallable = (
     Callable[[ResponseTypes | None], ResponseTypes | None]
     | Callable[[ResponseTypes | None], Awaitable[ResponseTypes | None]]

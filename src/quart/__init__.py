@@ -53,4 +53,5 @@ from .typing import ResponseReturnValue as ResponseReturnValue
 from .wrappers import ClientDisconnectedError as ClientDisconnectedError
 from .wrappers import Request as Request
 from .wrappers import Response as Response
+from .wrappers import ResponseSendResult as ResponseSendResult
 from .wrappers import Websocket as Websocket

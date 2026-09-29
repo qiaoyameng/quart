@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncGenerator
 from unittest.mock import AsyncMock
 from unittest.mock import Mock
 
@@ -11,12 +12,36 @@ from hypercorn.typing import HTTPScope
 from hypercorn.typing import WebsocketScope
 from werkzeug.datastructures import Headers
 
+from quart import ClientDisconnectedError
 from quart import Quart
+from quart import request
+from quart import Response
+from quart import ResponseSendResult
+from quart.asgi import _convert_os_error
 from quart.asgi import _convert_version
 from quart.asgi import _handle_exception
 from quart.asgi import ASGIHTTPConnection
 from quart.asgi import ASGIWebsocketConnection
 from quart.utils import encode_headers
+
+
+def _http_scope(method: str = "GET") -> HTTPScope:
+    return {
+        "type": "http",
+        "asgi": {},
+        "http_version": "1.1",
+        "method": method,
+        "scheme": "https",
+        "path": "/",
+        "raw_path": b"/",
+        "query_string": b"",
+        "root_path": "",
+        "headers": [(b"host", b"quart")],
+        "client": ("127.0.0.1", 80),
+        "server": None,
+        "extensions": {},
+        "state": {},  # type: ignore[typeddict-item]
+    }
 
 
 @pytest.mark.parametrize(
@@ -351,3 +376,217 @@ async def test__handle_exception(debug: bool, testing: bool, raises: bool) -> No
             await _handle_exception(app, ValueError())
     else:
         await _handle_exception(app, ValueError())
+
+
+async def test_response_complete_callback() -> None:
+    app = Quart(__name__)
+    results = []
+    paths = []
+
+    @app.route("/")
+    async def index() -> Response:
+        async def body() -> AsyncGenerator[bytes, None]:
+            yield b"abc"
+            yield b"defg"
+
+        response = Response(body())
+
+        @response.call_on_complete
+        async def on_complete(result: ResponseSendResult) -> None:
+            results.append(result)
+            # The original request context should be accessible
+            paths.append(request.path)
+
+        return response
+
+    connection = ASGIHTTPConnection(app, _http_scope())
+    sent = []
+
+    async def send(message: ASGISendEvent) -> None:
+        sent.append(message)
+
+    request_ = connection._create_request_from_scope(send)  # type: ignore
+    await connection.handle_request(request_, send)
+
+    assert len(results) == 1
+    assert results[0].bytes_sent == 7
+    assert results[0].state == "complete"
+    assert results[0].error is None
+    assert paths == ["/"]
+
+
+@pytest.mark.parametrize("fail_at, expected_bytes", [(1, 0), (2, 3), (3, 7)])
+async def test_response_complete_callback_send_failure(
+    fail_at: int, expected_bytes: int
+) -> None:
+    app = Quart(__name__)
+    results = []
+    body_closed = False
+
+    @app.route("/")
+    async def index() -> Response:
+        async def body() -> AsyncGenerator[bytes, None]:
+            nonlocal body_closed
+            try:
+                yield b"abc"
+                yield b"defg"
+            finally:
+                body_closed = True
+
+        response = Response(body())
+
+        @response.call_on_complete
+        async def on_complete(result: ResponseSendResult) -> None:
+            results.append(result)
+
+        return response
+
+    connection = ASGIHTTPConnection(app, _http_scope())
+    chunks = 0
+
+    async def send(message: ASGISendEvent) -> None:
+        nonlocal chunks
+        if message["type"] == "http.response.body":
+            chunks += 1
+            if chunks == fail_at:
+                raise RuntimeError("send failed")
+
+    request_ = connection._create_request_from_scope(send)  # type: ignore
+    with pytest.raises(RuntimeError):
+        await connection.handle_request(request_, send)
+
+    assert len(results) == 1
+    assert results[0].state == "error"
+    assert isinstance(results[0].error, RuntimeError)
+    # The failed chunk must not be counted as sent
+    assert results[0].bytes_sent == expected_bytes
+    # The body iterator must have been closed
+    assert body_closed
+
+
+async def test_response_complete_callback_disconnect() -> None:
+    app = Quart(__name__)
+    results = []
+
+    @app.route("/")
+    async def index() -> Response:
+        async def body() -> AsyncGenerator[bytes, None]:
+            yield b"abc"
+            yield b"defg"
+
+        response = Response(body())
+
+        @response.call_on_complete
+        async def on_complete(result: ResponseSendResult) -> None:
+            results.append(result)
+
+        return response
+
+    connection = ASGIHTTPConnection(app, _http_scope())
+    chunks = 0
+
+    async def raw_send(message: ASGISendEvent) -> None:
+        nonlocal chunks
+        if message["type"] == "http.response.body":
+            chunks += 1
+            if chunks == 2:
+                raise OSError("client gone")
+
+    send = _convert_os_error(raw_send)
+    request_ = connection._create_request_from_scope(send)  # type: ignore
+    with pytest.raises(ClientDisconnectedError):
+        await connection.handle_request(request_, send)
+
+    assert len(results) == 1
+    assert results[0].state == "disconnected"
+    assert isinstance(results[0].error, ClientDisconnectedError)
+    assert results[0].bytes_sent == 3
+
+
+@pytest.mark.parametrize("method", ["GET", "HEAD"])
+async def test_response_complete_callback_empty_response(method: str) -> None:
+    app = Quart(__name__)
+    results = []
+
+    @app.route("/")
+    async def index() -> Response:
+        response = Response(b"")
+
+        @response.call_on_complete
+        async def on_complete(result: ResponseSendResult) -> None:
+            results.append(result)
+
+        return response
+
+    connection = ASGIHTTPConnection(app, _http_scope(method))
+
+    async def send(message: ASGISendEvent) -> None:
+        pass
+
+    request_ = connection._create_request_from_scope(send)  # type: ignore
+    await connection.handle_request(request_, send)
+
+    assert len(results) == 1
+    assert results[0].state == "complete"
+    assert results[0].bytes_sent == 0
+
+
+async def test_response_complete_callback_notified_once() -> None:
+    response = Response(b"data")
+    calls = []
+
+    @response.call_on_complete
+    async def callback(result: ResponseSendResult) -> None:
+        calls.append(result)
+
+    result = ResponseSendResult(bytes_sent=4, state="complete")
+    await response.notify_complete(result)
+    await response.notify_complete(ResponseSendResult(bytes_sent=0, state="error"))
+    assert calls == [result]
+
+
+async def test_response_complete_callback_error_does_not_mask_send_error() -> None:
+    app = Quart(__name__)
+
+    @app.route("/")
+    async def index() -> Response:
+        response = Response(b"data")
+
+        @response.call_on_complete
+        async def on_complete(result: ResponseSendResult) -> None:
+            raise ValueError("callback error")
+
+        return response
+
+    connection = ASGIHTTPConnection(app, _http_scope())
+
+    async def send(message: ASGISendEvent) -> None:
+        if message["type"] == "http.response.body" and message.get("more_body"):
+            raise RuntimeError("send failed")
+
+    request_ = connection._create_request_from_scope(send)  # type: ignore
+    with pytest.raises(RuntimeError):
+        await connection.handle_request(request_, send)
+
+
+async def test_response_complete_callback_error_does_not_propagate() -> None:
+    app = Quart(__name__)
+
+    @app.route("/")
+    async def index() -> Response:
+        response = Response(b"data")
+
+        @response.call_on_complete
+        async def on_complete(result: ResponseSendResult) -> None:
+            raise ValueError("callback error")
+
+        return response
+
+    connection = ASGIHTTPConnection(app, _http_scope())
+
+    async def send(message: ASGISendEvent) -> None:
+        pass
+
+    request_ = connection._create_request_from_scope(send)  # type: ignore
+    # The callback error should be logged, not raised
+    await connection.handle_request(request_, send)

@@ -1635,6 +1635,11 @@ class Quart(App):
             if not from_error_handler:
                 raise
             self.logger.exception("Request finalizing errored")
+        if isinstance(response, Response):
+            # Remember the request context so that the response
+            # completion callbacks can be invoked with it active (by
+            # the ASGI layer) after the response has been sent.
+            response._request_context = ctx
         return response
 
     async def finalize_websocket(

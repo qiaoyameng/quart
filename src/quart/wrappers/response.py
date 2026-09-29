@@ -6,6 +6,7 @@ from collections.abc import AsyncGenerator
 from collections.abc import AsyncIterable
 from collections.abc import AsyncIterator
 from collections.abc import Iterable
+from dataclasses import dataclass
 from hashlib import md5
 from io import BytesIO
 from os import PathLike
@@ -31,7 +32,33 @@ from ..utils import file_path_to_path
 from ..utils import run_sync_iterable
 
 if TYPE_CHECKING:
+    from ..ctx import AppContext
+    from ..typing import ResponseCompleteCallable
     from .request import Request
+
+
+ResponseSendState = Literal["complete", "disconnected", "error"]
+
+
+@dataclass
+class ResponseSendResult:
+    """The final result of sending a response to the client.
+
+    Attributes:
+        bytes_sent: The number of body bytes successfully passed to
+            the ASGI ``send`` callable. A chunk that failed to send is
+            not included.
+        state: The final state of the response, one of
+            ``"complete"`` (fully sent), ``"disconnected"`` (the
+            client disconnected whilst sending) or ``"error"`` (the
+            body or sending raised an exception).
+        error: The exception that led to a ``"disconnected"`` or
+            ``"error"`` state, if any.
+    """
+
+    bytes_sent: int
+    state: ResponseSendState
+    error: BaseException | None = None
 
 
 class ResponseBody(ABC):
@@ -291,6 +318,10 @@ class Response(SansIOResponse):
         super().__init__(status, headers, mimetype, content_type)
         self.timeout: Any = Ellipsis
 
+        self._on_complete_callbacks: list[ResponseCompleteCallable] = []
+        self._complete_notified = False
+        self._request_context: AppContext | None = None
+
         self.response: ResponseBody
         if response is None:
             self.response = self.iterable_body_class([])
@@ -300,6 +331,43 @@ class Response(SansIOResponse):
             self.set_data(response)
         else:
             self.response = self.iterable_body_class(response)
+
+    def call_on_complete(
+        self, callback: ResponseCompleteCallable
+    ) -> ResponseCompleteCallable:
+        """Register a callback notified once the response has been sent.
+
+        The callback is invoked by the ASGI serving layer after the
+        response body has been fully sent, the client has disconnected,
+        or sending the body raised an exception. It is called with a
+        :class:`ResponseSendResult` describing the outcome and with the
+        original request context active, however the response has
+        already been sent and hence the headers and body can no longer
+        be altered.
+
+        The callbacks are notified at most once per response instance,
+        no matter how often the response is sent. This also applies to
+        HEAD requests and responses without a body.
+
+        Arguments:
+            callback: An async callable taking a
+                :class:`ResponseSendResult` argument.
+        """
+        self._on_complete_callbacks.append(callback)
+        return callback
+
+    async def notify_complete(self, result: ResponseSendResult) -> None:
+        """Notify the completion callbacks with the send *result*.
+
+        This is called by the ASGI serving layer once the response has
+        been sent (or sending failed). The callbacks are notified at
+        most once per response instance.
+        """
+        if self._complete_notified:
+            return
+        self._complete_notified = True
+        for callback in self._on_complete_callbacks:
+            await callback(result)
 
     @property
     def max_cookie_size(self) -> int:  # type: ignore

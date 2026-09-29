@@ -5,6 +5,7 @@ from .base import ClientDisconnectedError
 from .request import Body
 from .request import Request
 from .response import Response
+from .response import ResponseSendResult
 from .websocket import Websocket
 
 __all__ = (
@@ -13,5 +14,6 @@ __all__ = (
     "ClientDisconnectedError",
     "Request",
     "Response",
+    "ResponseSendResult",
     "Websocket",
 )

@@ -1,3 +1,12 @@
+## Unreleased
+
+- Add `Response.call_on_complete` to register an async callback that
+  is notified once the response has been sent via the ASGI server. The
+  callback receives a `ResponseSendResult` with the number of body
+  bytes actually sent and the final state (`"complete"`,
+  `"disconnected"`, or `"error"`), and runs with the original request
+  context active.
+
 ## Version 0.23.1
 
 Released 2026-08-29
